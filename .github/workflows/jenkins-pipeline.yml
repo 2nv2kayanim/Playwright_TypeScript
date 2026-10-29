@@ -1,0 +1,146 @@
+name: Trigger Jenkins pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-fork-pull-request:
+    name: Test fork pull request without secrets
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java for Allure
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      - name: Generate Allure report
+        if: always() && hashFiles('allure-results/**') != ''
+        run: npx allure generate allure-results --clean -o allure-report
+
+      - name: Upload test reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-reports
+          path: |
+            playwright-report/
+            allure-results/
+            allure-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  trigger-jenkins:
+    name: Run Jenkins pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB_PATH: ${{ vars.JENKINS_JOB_PATH }}
+      JENKINS_USER: ${{ secrets.JENKINS_USER }}
+      JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_REF: ${{ github.ref }}
+      GITHUB_READ_CREDENTIALS_ID: ${{ vars.GITHUB_READ_CREDENTIALS_ID }}
+      BENEFITS_PORTAL_URL: ${{ vars.BENEFITS_PORTAL_URL }}
+      USE_EXTERNAL_TEST_CREDENTIALS: ${{ vars.USE_EXTERNAL_TEST_CREDENTIALS || 'false' }}
+    steps:
+      - name: Trigger Jenkins and wait for the pipeline result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${JENKINS_URL:?Set the JENKINS_URL repository secret}"
+          : "${JENKINS_JOB_PATH:?Set the JENKINS_JOB_PATH repository variable}"
+          : "${JENKINS_USER:?Set the JENKINS_USER repository secret}"
+          : "${JENKINS_API_TOKEN:?Set the JENKINS_API_TOKEN repository secret}"
+
+          jenkins_url="${JENKINS_URL%/}"
+          job_path="${JENKINS_JOB_PATH#/}"
+          job_path="${job_path%/}"
+          headers_file="$RUNNER_TEMP/jenkins-response-headers"
+          auth="$JENKINS_USER:$JENKINS_API_TOKEN"
+
+          curl --fail --silent --show-error \
+            --user "$auth" \
+            --request POST \
+            --data-urlencode "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
+            --data-urlencode "GITHUB_REF=$GITHUB_REF" \
+            --data-urlencode "GITHUB_READ_CREDENTIALS_ID=$GITHUB_READ_CREDENTIALS_ID" \
+            --data-urlencode "BENEFITS_PORTAL_URL=$BENEFITS_PORTAL_URL" \
+            --data-urlencode "USE_EXTERNAL_TEST_CREDENTIALS=$USE_EXTERNAL_TEST_CREDENTIALS" \
+            --dump-header "$headers_file" \
+            --output /dev/null \
+            "$jenkins_url/$job_path/buildWithParameters"
+
+          queue_location="$(awk 'tolower($1) == "location:" { print $2 }' "$headers_file" | tr -d '\r')"
+          if [[ -z "$queue_location" ]]; then
+            echo "Jenkins accepted no queue location; check the Jenkins job URL and permissions."
+            exit 1
+          fi
+
+          queue_url="$(JENKINS_URL="$jenkins_url" QUEUE_LOCATION="$queue_location" python3 -c 'import os; from urllib.parse import urljoin; print(urljoin(os.environ["JENKINS_URL"].rstrip("/") + "/", os.environ["QUEUE_LOCATION"]))')"
+          build_url=""
+          for attempt in $(seq 1 180); do
+            queue_json="$(curl --fail --silent --show-error --user "$auth" "$queue_url/api/json")"
+            if [[ "$(jq -r '.cancelled // false' <<< "$queue_json")" == "true" ]]; then
+              echo "The Jenkins build was cancelled while waiting in the queue."
+              exit 1
+            fi
+
+            build_url="$(jq -r '.executable.url // empty' <<< "$queue_json")"
+            if [[ -n "$build_url" ]]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ -z "$build_url" ]]; then
+            echo "Timed out waiting for Jenkins to start the build."
+            exit 1
+          fi
+
+          for attempt in $(seq 1 270); do
+            build_json="$(curl --fail --silent --show-error --user "$auth" "${build_url%/}/api/json?tree=building,result,url")"
+            if [[ "$(jq -r '.building' <<< "$build_json")" == "false" ]]; then
+              result="$(jq -r '.result // "UNKNOWN"' <<< "$build_json")"
+              echo "Jenkins build result: $result"
+              echo "Jenkins build URL: $build_url"
+              printf 'Jenkins build: [%s](%s)\n' "$result" "$build_url" >> "$GITHUB_STEP_SUMMARY"
+              if [[ "$result" != "SUCCESS" ]]; then
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for the Jenkins build to finish: $build_url"
+          exit 1
